@@ -1,18 +1,18 @@
 import os
 import ssl
 import uuid
-import whisper
+import re
+import gc
 from pathlib import Path
 from groq import Groq
 from dotenv import load_dotenv
 from moviepy import VideoFileClip
-import re
 from docx import Document
 from docx.shared import Pt, Inches, RGBColor, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml.ns import qn
-from flask import Flask, request, jsonify, send_file, url_for
+from flask import Flask, request, jsonify, send_file
 
 ssl._create_default_https_context = ssl._create_unverified_context
 load_dotenv()
@@ -27,20 +27,36 @@ AUDIO_EXTENSIONS = ('.mp3', '.wav', '.m4a', '.flac')
 app = Flask(__name__)
 
 
-# ─── Core Functions (same as app.py) ────────────────────────────────
+# ─── Core Functions ────────────────────────────────────────────────
 
 def extract_audio(video_path: str) -> str:
+    """Extract audio from video file. Uses try/finally to prevent memory leaks."""
     audio_path = str(UPLOAD_DIR / f"{uuid.uuid4().hex}.wav")
     video = VideoFileClip(video_path)
-    video.audio.write_audiofile(audio_path, codec='pcm_s16le', fps=16000, logger=None)
-    video.close()
+    try:
+        video.audio.write_audiofile(audio_path, codec='pcm_s16le', fps=16000, logger=None)
+    finally:
+        video.close()
+        gc.collect()
     return audio_path
 
 
-def transcribe_audio(file_path: str, model_name: str = "base") -> str:
-    model = whisper.load_model(model_name)
-    result = model.transcribe(file_path)
-    return result.get("text", "")
+def transcribe_audio(file_path: str) -> str:
+    """
+    Transcribe audio using Groq's hosted Whisper API.
+    No local model loaded — zero memory overhead.
+    """
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    with open(file_path, "rb") as f:
+        transcription = client.audio.transcriptions.create(
+            file=(os.path.basename(file_path), f),
+            model="whisper-large-v3",
+            response_format="text"
+        )
+    # Groq returns a string directly when response_format="text"
+    if isinstance(transcription, str):
+        return transcription
+    return getattr(transcription, "text", "") or ""
 
 
 def analyze_with_groq(text: str, instructions: str = "") -> str:
@@ -220,7 +236,6 @@ List everything required before implementation can begin:
 
 def add_formatted_runs(paragraph, text):
     """Parse markdown inline formatting (**bold**, *italic*) and add runs to paragraph."""
-    # Split by ** for bold
     parts = re.split(r'(\*\*.*?\*\*)', text)
     for part in parts:
         if not part:
@@ -230,7 +245,6 @@ def add_formatted_runs(paragraph, text):
             run = paragraph.add_run(inner)
             run.bold = True
         elif '*' in part:
-            # Handle single * italic within remaining text
             sub_parts = re.split(r'(\*[^*]+?\*)', part)
             for sp in sub_parts:
                 if not sp:
@@ -243,7 +257,6 @@ def add_formatted_runs(paragraph, text):
         else:
             paragraph.add_run(part)
 
-    # Apply font to all runs
     for run in paragraph.runs:
         run.font.name = 'Calibri'
         run.font.size = Pt(11)
@@ -258,27 +271,22 @@ def flush_table(doc, table_rows):
     table = doc.add_table(rows=len(table_rows), cols=num_cols)
     table.style = 'Table Grid'
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
-
-    # Set table to auto-fit
     table.autofit = True
 
     for ri, row_data in enumerate(table_rows):
         for ci in range(num_cols):
             cell = table.rows[ri].cells[ci]
             cell_text = row_data[ci] if ci < len(row_data) else ""
-            # Clear default paragraph and write formatted text
             cell.text = ""
             p = cell.paragraphs[0]
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
             add_formatted_runs(p, cell_text)
 
-            # Style header row
             if ri == 0:
                 for run in p.runs:
                     run.bold = True
                     run.font.size = Pt(10)
                     run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-                # Dark header background
                 shading = cell._element.get_or_add_tcPr()
                 shading_elm = shading.makeelement(qn('w:shd'), {
                     qn('w:fill'): 'B92328',
@@ -288,7 +296,6 @@ def flush_table(doc, table_rows):
             else:
                 for run in p.runs:
                     run.font.size = Pt(10)
-                # Alternate row shading
                 if ri % 2 == 0:
                     shading = cell._element.get_or_add_tcPr()
                     shading_elm = shading.makeelement(qn('w:shd'), {
@@ -297,20 +304,18 @@ def flush_table(doc, table_rows):
                     })
                     shading.append(shading_elm)
 
-    doc.add_paragraph()  # spacing after table
+    doc.add_paragraph()
 
 
 def markdown_to_docx(markdown_text: str, output_path: str) -> str:
     doc = Document()
 
-    # ── Page margins
     for section in doc.sections:
         section.top_margin = Cm(2)
         section.bottom_margin = Cm(2)
         section.left_margin = Cm(2.5)
         section.right_margin = Cm(2.5)
 
-    # ── Base styles
     style = doc.styles['Normal']
     style.font.name = 'Calibri'
     style.font.size = Pt(11)
@@ -336,10 +341,8 @@ def markdown_to_docx(markdown_text: str, output_path: str) -> str:
         line = lines[i]
         stripped = line.strip()
 
-        # ── Table rows
         if stripped.startswith('|') and stripped.endswith('|'):
             cells = [c.strip() for c in stripped.split('|')[1:-1]]
-            # Skip separator rows like |---|---|
             if all(set(c) <= set('-: ') for c in cells):
                 i += 1
                 continue
@@ -353,14 +356,11 @@ def markdown_to_docx(markdown_text: str, output_path: str) -> str:
             flush_table(doc, table_rows)
             table_rows = []
             in_table = False
-            # Don't increment — process current line
 
-        # ── Empty lines
         if not stripped:
             i += 1
             continue
 
-        # ── Headings
         if stripped.startswith('### '):
             heading_text = stripped[4:].strip().strip('*#').strip()
             doc.add_heading(heading_text, level=3)
@@ -370,45 +370,33 @@ def markdown_to_docx(markdown_text: str, output_path: str) -> str:
         elif stripped.startswith('# '):
             heading_text = stripped[2:].strip().strip('*#').strip()
             doc.add_heading(heading_text, level=1)
-
-        # ── Horizontal rule
         elif stripped.startswith('---'):
             p = doc.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             run = p.add_run('_' * 60)
             run.font.color.rgb = RGBColor(0xCC, 0xCC, 0xCC)
             run.font.size = Pt(8)
-
-        # ── Sub-bullet (indented: "  - " or "    - ")
         elif re.match(r'^(\s{2,})([-*])\s', line):
             text = re.sub(r'^\s+[-*]\s', '', line)
             p = doc.add_paragraph(style='List Bullet 2')
             p.paragraph_format.left_indent = Cm(2)
             add_formatted_runs(p, text)
-
-        # ── Top-level bullet
         elif stripped.startswith('- ') or stripped.startswith('* '):
             text = stripped[2:]
             p = doc.add_paragraph(style='List Bullet')
             add_formatted_runs(p, text)
-
-        # ── Numbered list (e.g., "1. ", "12. ", "Step 1:")
         elif re.match(r'^\d+[\.\)]\s', stripped):
             match = re.match(r'^(\d+)[\.\)]\s*(.*)', stripped)
             if match:
-                num = match.group(1)
                 text = match.group(2)
                 p = doc.add_paragraph(style='List Number')
                 add_formatted_runs(p, text)
-
-        # ── Regular paragraph
         else:
             p = doc.add_paragraph()
             add_formatted_runs(p, stripped)
 
         i += 1
 
-    # Flush any remaining table
     if in_table and table_rows:
         flush_table(doc, table_rows)
 
