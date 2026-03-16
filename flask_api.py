@@ -3,12 +3,14 @@ import ssl
 import uuid
 import re
 import gc
+import math
 from pathlib import Path
 from groq import Groq
 from dotenv import load_dotenv
 from moviepy import VideoFileClip
+from pydub import AudioSegment
 from docx import Document
-from docx.shared import Pt, Inches, RGBColor, Cm
+from docx.shared import Pt, RGBColor, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml.ns import qn
@@ -24,13 +26,15 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.mov', '.avi', '.flv', '.wmv')
 AUDIO_EXTENSIONS = ('.mp3', '.wav', '.m4a', '.flac')
 
+GROQ_MAX_BYTES = 20 * 1024 * 1024  # 20MB safe limit (Groq hard limit is 25MB)
+
 app = Flask(__name__)
 
 
 # ─── Core Functions ────────────────────────────────────────────────
 
 def extract_audio(video_path: str) -> str:
-    """Extract audio from video file. Uses try/finally to prevent memory leaks."""
+    """Extract audio from video file."""
     audio_path = str(UPLOAD_DIR / f"{uuid.uuid4().hex}.wav")
     video = VideoFileClip(video_path)
     try:
@@ -41,22 +45,66 @@ def extract_audio(video_path: str) -> str:
     return audio_path
 
 
+def split_audio(file_path: str) -> list:
+    """
+    Split audio into chunks under GROQ_MAX_BYTES.
+    Returns list of chunk file paths.
+    """
+    file_size = os.path.getsize(file_path)
+
+    # No splitting needed
+    if file_size <= GROQ_MAX_BYTES:
+        return [file_path]
+
+    ext = Path(file_path).suffix.lower().strip('.')
+    fmt = ext if ext in ('mp3', 'wav', 'flac', 'm4a') else 'wav'
+
+    audio = AudioSegment.from_file(file_path, format=fmt)
+
+    # Calculate how many chunks we need
+    num_chunks = math.ceil(file_size / GROQ_MAX_BYTES)
+    chunk_duration_ms = math.ceil(len(audio) / num_chunks)
+
+    chunk_paths = []
+    for idx in range(num_chunks):
+        start = idx * chunk_duration_ms
+        end = min((idx + 1) * chunk_duration_ms, len(audio))
+        chunk = audio[start:end]
+
+        chunk_path = str(UPLOAD_DIR / f"{uuid.uuid4().hex}_chunk{idx}.wav")
+        chunk.export(chunk_path, format="wav")
+        chunk_paths.append(chunk_path)
+
+    return chunk_paths
+
+
 def transcribe_audio(file_path: str) -> str:
     """
-    Transcribe audio using Groq's hosted Whisper API.
-    No local model loaded — zero memory overhead.
+    Transcribe audio using Groq Whisper API.
+    Automatically splits large files into chunks under 20MB.
     """
     client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    with open(file_path, "rb") as f:
-        transcription = client.audio.transcriptions.create(
-            file=(os.path.basename(file_path), f),
-            model="whisper-large-v3",
-            response_format="text"
-        )
-    # Groq returns a string directly when response_format="text"
-    if isinstance(transcription, str):
-        return transcription
-    return getattr(transcription, "text", "") or ""
+    chunk_paths = split_audio(file_path)
+    full_transcription = []
+
+    try:
+        for chunk_path in chunk_paths:
+            with open(chunk_path, "rb") as f:
+                result = client.audio.transcriptions.create(
+                    file=(os.path.basename(chunk_path), f),
+                    model="whisper-large-v3",
+                    response_format="text"
+                )
+            text = result if isinstance(result, str) else getattr(result, "text", "")
+            if text:
+                full_transcription.append(text.strip())
+    finally:
+        # Clean up chunk files (but not the original)
+        for chunk_path in chunk_paths:
+            if chunk_path != file_path and os.path.exists(chunk_path):
+                os.remove(chunk_path)
+
+    return " ".join(full_transcription)
 
 
 def analyze_with_groq(text: str, instructions: str = "") -> str:
@@ -93,7 +141,7 @@ Your role is to produce professional, implementation-ready Technical Approach Do
 **DOCUMENT STRUCTURE** (include only relevant sections):
 
 # Technical Approach : [Client Name or Company Name]
-(Extract client/company name from the transcription or suggest based on context. This is the document title — do NOT include a separate project header table.)
+(Extract client/company name from the transcription or suggest based on context.)
 
 # 1. PROJECT OBJECTIVES
 - Summarize the business problem the client wants to solve.
@@ -101,119 +149,31 @@ Your role is to produce professional, implementation-ready Technical Approach Do
 - Identify the target audience or customer segment if mentioned.
 
 # 2. FEATURE LISTING
-Provide a summary table of ALL features/modules that will be implemented:
 | # | Feature/Module | Description | Build Method |
 |---|---|---|---|
 | 1 | (e.g., Lead Capture Funnel) | (brief description) | (GHL Native / Custom HTML / API) |
-| 2 | ... | ... | ... |
-(List every feature discussed — this gives a quick overview before the detailed breakdown.)
 
 # 3. FEATURE DETAILING
-For EACH feature listed in the table above, provide a full detailed breakdown with numbered implementation steps:
 
 ## 3.1 Lead Qualification & Custom Forms
-- List each form needed with specific field names, field types, and validation rules.
-- Define qualification logic (e.g., conditional fields, scoring criteria).
-- Specify where forms will be embedded or triggered.
-- **Steps:** Number each implementation step (Step 1: Create form in GHL > Sites > Forms, Step 2: Add fields..., etc.).
-
 ## 3.2 Funnels & Landing Pages
-- Describe each funnel step (landing page -> thank you page -> upsell, etc.).
-- For each page, specify: **Build Method** (GHL Native Builder or Custom HTML).
-- Detail every section/block of each page: hero section, features, testimonials, CTA, form placement, footer, etc.
-- Note headline focus, CTA text, color scheme, and form placement per page.
-- Mention any A/B testing or tracking requirements.
-- **Steps:** Number each implementation step.
-
 ## 3.3 Website (if applicable)
-- Specify **Build Method:** GHL Native Builder or Custom HTML.
-- Detail every page needed (Home, About, Services, Contact, etc.).
-- For each page, list every section/block with content guidance.
-- Specify navigation structure, header, and footer layout.
-- **Steps:** Number each implementation step.
-
 ## 3.4 Calendar & Scheduling
-- Define calendar type (Round Robin, Collective, Class Booking, etc.).
-- Specify booking rules: availability windows, buffer times, meeting duration.
-- Note any pre-booking qualification steps.
-- **Steps:** Number each implementation step.
-
 ## 3.5 Pipeline & Deal Tracking
-- Define each pipeline with ALL its stages listed in order (e.g., New Lead -> Contacted -> Qualified -> Proposal Sent -> Won/Lost).
-- For EACH stage, specify: stage name, stage actions, automation triggers, manual actions required, and transition criteria to next stage.
-- Specify stage-transition triggers (manual vs. automated).
-- Note any monetary values or probability percentages per stage.
-- **Steps:** Number each implementation step.
-
 ## 3.6 Proposals, Contracts & Payments
-- Define the proposal/estimate template structure.
-- Specify e-signature requirements.
-- Detail payment integration (Stripe, etc.), pricing tiers, and invoicing logic.
-- **Steps:** Number each implementation step.
-
 ## 3.7 Automation Workflows
-For EACH workflow, provide a FULL detailed breakdown:
-- **Workflow Name:** Descriptive name
-- **Trigger:** What starts it (e.g., form submission, tag added, pipeline stage change).
-- **Detailed Step-by-Step Actions:** List EVERY action in sequence with wait times, conditions, and content:
-  - Step 1: [Action type] - [Details]
-  - Step 2: Wait [duration]
-  - Step 3: If/Else [condition] - Yes branch: [actions] / No branch: [actions]
-  - (continue for ALL steps)
-- **Goal/Exit Condition:** What ends the workflow early (e.g., appointment booked).
-
-Common workflows to consider (include only if relevant):
-- New Lead Nurture Sequence
-- Appointment Confirmation & Reminders
-- No-Show / Cancellation Follow-Up
-- Post-Meeting Follow-Up
-- Re-engagement Campaign
-- Internal Team Notifications
-- Pipeline Stage Automation
-
 ## 3.8 AI & Chatbot Configuration
-- Define the chat widget placement and trigger rules.
-- Specify the AI bot's role, tone, and conversation boundaries.
-- List the intents/scenarios the bot should handle.
-- Define handoff rules to a live agent.
-- **Steps:** Number each implementation step.
 
 # 4. THIRD-PARTY INTEGRATIONS & TOOLS
-Provide a table with ALL third-party tools required:
 | Tool/Service | Purpose | Integration Method | Required Plan/Cost | Priority |
 |---|---|---|---|---|
-| (list each tool) | | (API/Zapier/Webhook/Native) | | (Must-have/Nice-to-have) |
-
-- Note any custom webhook or API requirements.
-- Specify domain, DNS, or hosting considerations.
 
 # 5. DASHBOARD & REPORTING
-- Define 3-5 key KPIs to track based on project goals.
-- Suggest a reporting dashboard layout with specific widgets.
-- Note any automated report delivery (email summaries, Slack alerts).
-
 # 6. AGENT / TEAM MANUAL RESPONSIBILITIES
-- List specific manual actions the team must perform daily/weekly.
-- Define SOPs for pipeline management and lead follow-up.
-- Specify any data hygiene tasks (e.g., updating contact statuses, clearing stale leads).
-
 # 7. SUGGESTIONS & ASSUMPTIONS
-- For any ambiguous or missing details, provide your best-practice recommendations with clear reasoning.
-- Mark each suggestion with "Suggested:" prefix so the team can review and confirm.
-- Do NOT frame these as questions to the client — instead, propose a concrete solution or configuration for each gap.
-
 # 8. PREREQUISITES
-List everything required before implementation can begin:
-- GHL sub-account setup requirements
-- Domain and DNS configurations needed
-- Third-party account credentials required
-- Content/assets the client must provide (logos, copy, images, etc.)
-- Access permissions needed
-- Any existing systems that need to be audited or migrated
-
 # 9. NEXT STEPS
-- If based on the call the client seems interested to move further, include this note: "Please provide GHL sub-account access to dev.patel@theonetechnologies.co.in to begin implementation."
-- List immediate action items for both the client and the development team.
+- "Please provide GHL sub-account access to dev.patel@theonetechnologies.co.in to begin implementation."
 
 ---
 
@@ -235,14 +195,12 @@ List everything required before implementation can begin:
 
 
 def add_formatted_runs(paragraph, text):
-    """Parse markdown inline formatting (**bold**, *italic*) and add runs to paragraph."""
     parts = re.split(r'(\*\*.*?\*\*)', text)
     for part in parts:
         if not part:
             continue
         if part.startswith('**') and part.endswith('**'):
-            inner = part[2:-2]
-            run = paragraph.add_run(inner)
+            run = paragraph.add_run(part[2:-2])
             run.bold = True
         elif '*' in part:
             sub_parts = re.split(r'(\*[^*]+?\*)', part)
@@ -264,7 +222,6 @@ def add_formatted_runs(paragraph, text):
 
 
 def flush_table(doc, table_rows):
-    """Render collected table rows into a properly formatted DOCX table."""
     if not table_rows:
         return
     num_cols = max(len(r) for r in table_rows)
@@ -289,8 +246,7 @@ def flush_table(doc, table_rows):
                     run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
                 shading = cell._element.get_or_add_tcPr()
                 shading_elm = shading.makeelement(qn('w:shd'), {
-                    qn('w:fill'): 'B92328',
-                    qn('w:val'): 'clear'
+                    qn('w:fill'): 'B92328', qn('w:val'): 'clear'
                 })
                 shading.append(shading_elm)
             else:
@@ -299,8 +255,7 @@ def flush_table(doc, table_rows):
                 if ri % 2 == 0:
                     shading = cell._element.get_or_add_tcPr()
                     shading_elm = shading.makeelement(qn('w:shd'), {
-                        qn('w:fill'): 'F5F5F5',
-                        qn('w:val'): 'clear'
+                        qn('w:fill'): 'F5F5F5', qn('w:val'): 'clear'
                     })
                     shading.append(shading_elm)
 
@@ -362,14 +317,11 @@ def markdown_to_docx(markdown_text: str, output_path: str) -> str:
             continue
 
         if stripped.startswith('### '):
-            heading_text = stripped[4:].strip().strip('*#').strip()
-            doc.add_heading(heading_text, level=3)
+            doc.add_heading(stripped[4:].strip().strip('*#').strip(), level=3)
         elif stripped.startswith('## '):
-            heading_text = stripped[3:].strip().strip('*#').strip()
-            doc.add_heading(heading_text, level=2)
+            doc.add_heading(stripped[3:].strip().strip('*#').strip(), level=2)
         elif stripped.startswith('# '):
-            heading_text = stripped[2:].strip().strip('*#').strip()
-            doc.add_heading(heading_text, level=1)
+            doc.add_heading(stripped[2:].strip().strip('*#').strip(), level=1)
         elif stripped.startswith('---'):
             p = doc.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -382,15 +334,13 @@ def markdown_to_docx(markdown_text: str, output_path: str) -> str:
             p.paragraph_format.left_indent = Cm(2)
             add_formatted_runs(p, text)
         elif stripped.startswith('- ') or stripped.startswith('* '):
-            text = stripped[2:]
             p = doc.add_paragraph(style='List Bullet')
-            add_formatted_runs(p, text)
+            add_formatted_runs(p, stripped[2:])
         elif re.match(r'^\d+[\.\)]\s', stripped):
             match = re.match(r'^(\d+)[\.\)]\s*(.*)', stripped)
             if match:
-                text = match.group(2)
                 p = doc.add_paragraph(style='List Number')
-                add_formatted_runs(p, text)
+                add_formatted_runs(p, match.group(2))
         else:
             p = doc.add_paragraph()
             add_formatted_runs(p, stripped)
@@ -408,17 +358,6 @@ def markdown_to_docx(markdown_text: str, output_path: str) -> str:
 
 @app.route("/api/generate", methods=["POST"])
 def generate():
-    """
-    Generate a GHL Technical Approach Document.
-
-    Accepts multipart/form-data:
-      - file (optional): video or audio file
-      - instructions (optional): text notes/instructions
-
-    At least one of file or instructions must be provided.
-
-    Returns the DOCX file directly as a download.
-    """
     file = request.files.get("file")
     instructions = request.form.get("instructions", "").strip()
 
@@ -479,7 +418,6 @@ def generate():
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    """Health check endpoint."""
     return jsonify({"status": "ok", "service": "GHL Solution Architect API"})
 
 

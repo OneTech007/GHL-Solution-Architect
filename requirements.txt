@@ -28,6 +28,8 @@ httpx==0.28.1
 idna==3.11
 ImageIO==2.37.2
 imageio-ffmpeg==0.6.0
+pydub
+ffmpeg-python
 Jinja2==3.1.6
 llvmlite==0.46.0
 lxml==6.0.2
